@@ -65,13 +65,13 @@ void ftp_state_free(ftp_state_t *state)
 {
     assert(state != NULL);
 
-    if(state->username)
+    if(state->username != NULL)
         free(state->username);
     
-    if(state->password)
+    if(state->password != NULL)
         free(state->password);
 
-    if(state->curdir)
+    if(state->curdir != NULL)
         free(state->curdir);
 
     free(state);

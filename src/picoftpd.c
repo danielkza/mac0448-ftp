@@ -8,6 +8,7 @@
 #include <getopt.h>
 
 #include <unistd.h>
+#include <errno.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -84,20 +85,25 @@ int main(__attribute__((unused)) int argc, __attribute__((unused)) char **argv)
         }
 
         *space_pos = '\0';
+        
         char *command_name = buf, *arg = space_pos + 1;
-
         ftp_command_t *command = NULL;
+
         for(size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
             if(strcasecmp(commands[i].name, command_name) == 0) {
-                commands = (*commands[i].func)(arg, NULL);
-                goto next;
+                command = &commands[i];
+                break;
             }
         }
-
-        printf("Unknown command %s\n", name);
+        
+        if(command == NULL) {
+            printf("Unknown command %s\n", command_name);
+        } else {
+            int command_res = (*command->func)(arg, state);
+            printf("%d\n", command_res);
+        }
     }
 
-end:
     if(buf != NULL)
         free(buf);
 
