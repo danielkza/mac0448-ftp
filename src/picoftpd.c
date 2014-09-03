@@ -3,110 +3,107 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <strings.h>
-
-#include <getopt.h>
+#include <assert.h>
 
 #include <unistd.h>
+#include <strings.h>
 #include <errno.h>
+#include <getopt.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 
-#include "picoftpd.h"
+#include "commands.h"
+#include "util.h"
 
-int ftp_nop(const char *arg, ftp_state_t *state)
+static ssize_t str_remove_suffix(char *str, const char *suffix)
 {
-    printf("NOP\n");
-    printf("%s\n", arg);
-    if(state != NULL) {
-        printf("%s", state->username);
+    assert(str != NULL);
+    assert(suffix != NULL);
+    
+    char *str_end = strchr(str, '\0'),
+         *suffix_end = strchr(suffix, '\0');
+         
+    while((str_end != str || suffix_end != suffix)
+          && *(str_end - 1) == *(suffix_end - 1)) {
+        --str_end;
+        --suffix_end;
     }
-
-    return 0;
+    
+    if(suffix_end == suffix) {
+        *str_end = '\0';
+        return str_end - str;
+    } else {
+        return -1;
+    }
 }
 
-int ftp_user(const char *arg, ftp_state_t *state)
+static ftp_status_t ftp_parse_run_command(FILE *in, char **buf, size_t *buf_len, ftp_state_t *state)
 {
-    const char *user = arg;
-    if(strlen(user) == 0)
-        user = NULL;
+    assert(buf != NULL);
+    assert(buf_len != NULL);
+    
+    errno = 0;
+    if(getline(buf, buf_len, in) < 0) {
+        if(errno != 0) {
+            perror("Error: getline: ");
+            return FTP_STATUS_INVALID_SYNTAX;
+        }
+        
+        return FTP_COMMAND_EOF;
+    }
+   
+    if(str_remove_suffix(*buf, "\r\n") <= 0)
+        return FTP_STATUS_INVALID_SYNTAX;
+   
+    char *command_name = *buf, *arg;
+    char *space_pos = strchr(*buf, ' ');
+    if(space_pos == NULL)
+        arg = NULL;
+    else {
+        *space_pos = '\0';
+        arg = space_pos + 1;
+    }
+    
+    ftp_command_t *cur_command = &(picoftpd_commands[0]);
 
-    printf("Setting user to: %s\n", user != NULL ? user : "NULL");
-    ftp_state_set_username(state, user);
-    ftp_state_set_password(state, NULL);
-
-    return 230;
+    while(cur_command->name != NULL
+          && strcasecmp(cur_command->name, command_name) != 0) {
+        cur_command++;
+    }
+    
+    if(cur_command->name == NULL)
+        return FTP_STATUS_INVALID_SYNTAX;
+    
+    printf("arg: '%s'\n", arg);
+    int command_res = (*cur_command->func)(arg, state);
+    
+    return command_res;
 }
 
-int ftp_pass(const char *arg, ftp_state_t *state)
-{
-    const char *pass = arg;
-    if(strlen(pass) == 0)
-        pass = NULL;
-
-    if(state->username == NULL)
-        return 503;
-
-    ftp_state_set_password(state, pass);
-    return 230;
-}
-
-int main(__attribute__((unused)) int argc, __attribute__((unused)) char **argv)
+int main(UNUSED int argc, UNUSED char **argv)
 {
     int ret = 0;
-    ftp_command_t commands[] = {
-        {"USER", &ftp_user},
-        {"PASS", &ftp_pass},
-    };
 
     char *buf = NULL;
     size_t buf_len = 0;
 
     ftp_state_t *state = ftp_state_new();
 
-    for(;;) {
-        errno = 0;
-        
-        if(getline(&buf, &buf_len, stdin) < 0) {
-            if(errno != 0) {
-                perror("Error: getline: ");
-                ret = 1;
-            }
-    
-            break;   
-        }
-
-        char *space_pos = strchr(buf, ' ');
-        if(space_pos == NULL) {
-            printf("invalid syntax\n");
-            ret = 1;
+    while(1) {
+        ftp_status_t ftp_status;
+        ftp_status = ftp_parse_run_command(stdin, &buf, &buf_len, state);
+        if (ftp_status == FTP_STATUS_CLOSING)
             break;
-        }
-
-        *space_pos = '\0';
+        else if (ftp_status > 0)
+            printf("%d\n", (int)ftp_status);
+        else
+            break;
         
-        char *command_name = buf, *arg = space_pos + 1;
-        ftp_command_t *command = NULL;
-
-        for(size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
-            if(strcasecmp(commands[i].name, command_name) == 0) {
-                command = &commands[i];
-                break;
-            }
-        }
         
-        if(command == NULL) {
-            printf("Unknown command %s\n", command_name);
-        } else {
-            int command_res = (*command->func)(arg, state);
-            printf("%d\n", command_res);
-        }
     }
-
-    if(buf != NULL)
-        free(buf);
-
+    
     free(state);
+    free(buf);
     return ret;
 }
