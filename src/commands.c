@@ -101,6 +101,17 @@ int ftp_stru(const char *arg, ftp_state_t *state)
     }
 }
 
+int ftp_pasv(UNUSED const char *arg, ftp_state_t *state)
+{
+ if(state->is_passive == 1)
+     return FTP_STATUS_INVALID_COMMAND_SEQUENCE;
+ 
+ if(ftp_state_open_data_socket(state) == 1)
+     return FTP_STATUS_ENTERING_PASSIVE;
+ else
+     return FTP_STATUS_INVALID_COMMAND_SEQUENCE;
+}
+
 ftp_command_t picoftpd_commands[] = {
     {"NOOP", &ftp_noop},
     {"USER", &ftp_user},
@@ -108,6 +119,7 @@ ftp_command_t picoftpd_commands[] = {
     {"TYPE", &ftp_type},
     {"MODE", &ftp_mode},
     {"STRU", &ftp_stru},
-    {"QUIT", &ftp_quit}, 
+    {"QUIT", &ftp_quit},
+    {"PASV", &ftp_pasv},
     {NULL, NULL}, 
 };

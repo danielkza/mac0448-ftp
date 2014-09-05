@@ -17,6 +17,7 @@ extern ftp_command_t picoftpd_commands[];
 typedef enum{
     FTP_STATUS_OK = 200,
     FTP_STATUS_CLOSING = 221, 
+    FTP_STATUS_ENTERING_PASSIVE = 227, 
     FTP_STATUS_USER_LOGGED_IN = 230,
     FTP_STATUS_INVALID_SYNTAX = 500,
     FTP_STATUS_INVALID_SYNTAX_PARAMS = 501,
