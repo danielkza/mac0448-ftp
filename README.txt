@@ -48,7 +48,14 @@ Rafael Marinaro Verona    - Nº USP: 7577323
 
 == Compilação ==
 
-	
+Programas necessários: autoconf, automake, compilador de C
+Comandos para compilação:
+$ autoreconf -i
+$ ./configure
+$ make
+
+O executável será criado como `src/picoftpd` na pasta atual no momento da
+execução do `configure`.
 
 == Instruções de uso ==
 
