@@ -47,7 +47,7 @@ static ftp_status_t ftp_parse_run_command(FILE *in, char **buf, size_t *buf_len,
     errno = 0;
     if(getline(buf, buf_len, in) < 0) {
         if(errno != 0) {
-            perror("Error: getline: ");
+            perror("getline: ");
             return FTP_STATUS_INVALID_SYNTAX;
         }
         
@@ -56,6 +56,8 @@ static ftp_status_t ftp_parse_run_command(FILE *in, char **buf, size_t *buf_len,
    
     if(str_remove_suffix(*buf, "\r\n") <= 0)
         return FTP_STATUS_INVALID_SYNTAX;
+    
+    printf("Line: '%s'\n", *buf);
    
     char *command_name = *buf, *arg;
     char *space_pos = strchr(*buf, ' ');
@@ -95,8 +97,8 @@ char* ftp_pasv_reply(ftp_state_t *state)
     while((addr_dot = strchr(addr_dot, '.')) != NULL)
         *(addr_dot++) = ',';
     
-    unsigned int port_high = (data_addr.sin_port >> 8) & 0xFF,
-                 port_low = (data_addr.sin_port) & 0xFF;
+    unsigned int port_high = (ntohs(data_addr.sin_port) >> 8) & 0xFF,
+                 port_low = (ntohs(data_addr.sin_port)) & 0xFF;
       
     char *result;
     if(asprintf(&result, "227 Entering Passive Mode (%s,%u,%u)\r\n",
@@ -121,21 +123,36 @@ void ftp_do_control(int control_socket)
     if(control_file == NULL)
         return;
     
-    printf("control_file: %p\n", control_file);
+    fputs("220 picoftpd\r\n", control_file);
     
     char *buf = NULL;
     size_t buf_len = 0;
        
     for(;;) {
         ftp_status_t ftp_status;
-        ftp_status = ftp_parse_run_command(control_file, &buf, &buf_len, state);
         
-        printf("status %d\n", (int) ftp_status);
-        
+        if(state->data_pid > 0) {
+            int status = 0;
+            if(waitpid(state->data_pid, &status, 0) > 0) {
+                if(WEXITSTATUS(status) != 0)
+                    ftp_status = FTP_STATUS_TRANSFER_FAILED;
+                else
+                    ftp_status = FTP_STATUS_TRANSFER_SUCCEEDED;
+                
+                state->data_pid = 0;
+            } else {
+                perror("waitpid: ");
+                break;
+            }
+        } else {
+            ftp_status = ftp_parse_run_command(control_file, &buf, &buf_len, state);
+        }
+         
         if (ftp_status == FTP_STATUS_CLOSING)
             break;
         else if (ftp_status == FTP_STATUS_ENTERING_PASSIVE) {
-            char *reply = ftp_pasv_reply(state); 
+            char *reply = ftp_pasv_reply(state);
+            printf("pasv reply: %s", reply);
             fputs(reply, control_file);
             free(reply);
         }
@@ -147,6 +164,9 @@ void ftp_do_control(int control_socket)
     
     free(state);
     free(buf);
+    fclose(control_file);
+    
+    state->control_socket = -1;
 }
 
 int main(int argc, char **argv)
@@ -214,9 +234,11 @@ int main(int argc, char **argv)
             close(control_listen_socket);
             printf("do_control\n");
             ftp_do_control(control_socket);
+            
+            exit(0);
+        } else {
+            close(control_socket);
         }
-        
-        close(control_socket);
     }
     
     close(control_listen_socket);

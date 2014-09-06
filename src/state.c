@@ -13,6 +13,7 @@
 
 #include "util.h"
 #include "state.h"
+#include "commands.h"
 
 ftp_state_t* ftp_state_new(void)
 {
@@ -22,14 +23,14 @@ ftp_state_t* ftp_state_new(void)
     state->password = NULL;
     state->curdir = NULL;
     
-    state->is_passive = 0;
     state->is_mode_stream = 1;
     state->is_type_image = 0;
     state->is_structure_file = 1;
     
-    state->data_socket = -1;
+    state->data_listen_socket = -1;
     state->control_socket = -1;
     state->data_pid = 0;
+    
     return state;
 }
 
@@ -73,16 +74,6 @@ int ftp_state_set_curdir(ftp_state_t *state, const char *curdir)
     return 1;
 }
 
-int ftp_state_set_passive(ftp_state_t *state, int is_passive)
-{
-    assert(state != NULL);
-    
-    int old = state->is_passive;
-    state->is_passive = (is_passive != 0) ? 1 : 0;
-    
-    return old;
-}
-
 int ftp_state_set_type_image(ftp_state_t *state, int is_image)
 {
     assert(state != NULL);
@@ -115,37 +106,42 @@ int ftp_state_set_structure_file(ftp_state_t *state, int is_file)
 
 int ftp_state_open_data_socket(ftp_state_t *state)
 {
-    if(state->data_listen_socket != -1 || state->data_socket != -1
-       || state->data_pid != 0 || state->control_socket == -1)
-        return 0;
+    printf("open_data_socket\n");
     
-    struct sockaddr_in data_addr;
+    if(state->data_listen_socket != -1 || state->data_pid != 0 || state->control_socket == -1)
+        return FTP_STATUS_INVALID_COMMAND_SEQUENCE;
+    
+    struct sockaddr_in data_addr = {0};
     socklen_t data_addr_len = sizeof(data_addr);
-    if(getsockname(state->control_socket, (struct sockaddr *)&data_addr, &data_addr_len) == -1)
-        return 0;
+    if(getsockname(state->control_socket, (struct sockaddr *)&data_addr, &data_addr_len) == -1) {
+        printf("getsockname: ");
+        return FTP_STATUS_CANT_OPEN_DATA_CONNECTION;
+    }
     
     data_addr.sin_port = htons(0);
     
     int data_socket = socket(AF_INET, SOCK_STREAM, 0);
-    if(data_socket == -1)
-        return 0;
+    if(data_socket == -1) {
+        printf("socket: ");
+        return FTP_STATUS_CANT_OPEN_DATA_CONNECTION;
+    }
     
     if(bind(data_socket, (struct sockaddr *)&data_addr, sizeof(data_addr)) == -1) {
-        perror("bind: ");
+        printf("bind: ");
         close(data_socket);
         
-        return 0;
+        return FTP_STATUS_CANT_OPEN_DATA_CONNECTION;
     }
        
     if(listen(data_socket, 1) == -1) {
-        perror("listen: ");
+        printf("listen: ");
         close(data_socket);
         
-        return 0;
+        return FTP_STATUS_CANT_OPEN_DATA_CONNECTION;
     }
      
-    state->data_socket = data_socket;
-    return 1;
+    state->data_listen_socket = data_socket;
+    return FTP_STATUS_ENTERING_PASSIVE;
 }
 
 void ftp_state_free(ftp_state_t *state)
