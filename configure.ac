@@ -12,20 +12,23 @@ AC_DEFUN([AC_CHECK_HEADER_MANDATORY], [
 	])
 ])
 
-AC_CHECK_HEADER_MANDATORY(stdio.h)
-AC_CHECK_HEADER_MANDATORY(unistd.h)
+AC_CHECK_HEADER_MANDATORY(arpa/inet.h)
+AC_CHECK_HEADER_MANDATORY(fcntl.h)
+AC_CHECK_HEADER_MANDATORY(netinet/in.h)
+AC_CHECK_HEADER_MANDATORY(poll.h)
+
+AC_CHECK_HEADER_MANDATORY(strings.h)
+AC_CHECK_HEADER_MANDATORY(sys/mman.h)
+AC_CHECK_HEADER_MANDATORY(sys/socket.h)
 AC_CHECK_HEADER_MANDATORY(sys/types.h)
 AC_CHECK_HEADER_MANDATORY(sys/wait.h)
-AC_CHECK_HEADER_MANDATORY(sys/socket.h)
-AC_CHECK_HEADER_MANDATORY(netdb.h)
-AC_CHECK_HEADER_MANDATORY(netinet/in.h)
+AC_CHECK_HEADER_MANDATORY(unistd.h)
 
-AC_CHECK_HEADER_MANDATORY(getopt.h)
-AC_SEARCH_LIBS(getopt_long, [gnugetopt], [], [ 
-	AC_MSG_ERROR([missing getopt_long()])
+AC_CHECK_HEADER_MANDATORY(semaphore.h)
+AC_SEARCH_LIBS(sem_wait, [pthread], [], [
+    AC_MSG_ERROR([missing POSIX semaphores])
 ])
 
-AC_CONFIG_HEADERS([src/config.h])
 AC_CONFIG_FILES([
 	Makefile
 	src/Makefile

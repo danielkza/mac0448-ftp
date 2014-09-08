@@ -1,161 +1,145 @@
 #define _GNU_SOURCE
 
-#include <stdlib.h>
-#include <stdio.h>
+#include <stdarg.h>
+#include <stdbool.h>
 #include <string.h>
 #include <assert.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <errno.h>
 
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/types.h>
-#include <sys/socket.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
+#include <sys/mman.h>
+#include <semaphore.h>
 
 #include "util.h"
+
 #include "state.h"
-#include "commands.h"
 
 ftp_state_t* ftp_state_new(void)
 {
-    ftp_state_t *state = malloc_e(sizeof(*state));
+    ftp_state_t *state = malloc(sizeof(*state));
+    if(state == NULL)
+        return NULL;
+
+    /* Initialize defaults first so cleanup can rely on their values to
+     * determine what too cleanup
+     */
 
     state->username = NULL;
     state->password = NULL;
-    state->curdir = NULL;
-    
+    state->curdir_fd = -1;
+
     state->is_mode_stream = 1;
     state->is_type_image = 0;
     state->is_structure_file = 1;
-    
+
     state->data_listen_socket = -1;
     state->control_socket = -1;
     state->data_pid = 0;
-    
+
+    state->control_sem = NULL;
+    state->control_sem_initialized = false;
+
+    // We can create the complex stuff now
+    state->curdir_fd = open(".", O_RDONLY);
+    if(state->curdir_fd == -1) {
+        ftp_debug_perror(state, "open");
+        goto error;
+    }
+
+    state->control_sem = mmap(NULL, sizeof(*state->control_sem),
+                              PROT_READ | PROT_WRITE,
+                              MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+    if(state->control_sem == NULL) {
+        ftp_debug_perror(state, "mmap");
+        goto error;
+    }
+
+    if(sem_init(state->control_sem, 1, 1) == -1) {
+        ftp_debug_perror(state, "sem_init");
+        goto error;
+    }
+
+    state->control_sem_initialized = 1;
     return state;
+
+error:
+    ftp_state_free(state);
+    return NULL;
 }
 
-void ftp_state_set_username(ftp_state_t *state, const char *username)
+bool ftp_state_free(ftp_state_t *state)
 {
-    assert(state != NULL);
+    if(state == NULL)
+        return true;
 
-    if(state->username != NULL)
-        free(state->username);
+    if(state->data_listen_socket != -1 || state->control_socket != -1
+       || state->data_pid > 0)
+        return false;
 
-    if(username != NULL)
-        state->username = strdup_e(username);
-}
+    if(state->curdir_fd != -1)
+        close(state->curdir_fd);
 
-void ftp_state_set_password(ftp_state_t *state, const char *password)
-{
-    assert(state != NULL);
+    if(state->control_sem != NULL) {
+        if(state->control_sem_initialized)
+            sem_destroy(state->control_sem);
 
-    if(state->password != NULL)
-        free(state->password);
-
-    if(password != NULL)
-        state->password = strdup_e(password);
-}
-
-int ftp_state_set_curdir(ftp_state_t *state, const char *curdir)
-{
-    assert(state != NULL);
-    assert(curdir != NULL);
-
-    if(strlen(curdir) == 0)
-        return 0;
-
-    if(chdir(curdir) != 0)
-        return 0;
-
-    if(state->curdir != NULL)
-        free(state->curdir);
-
-    state->curdir = strdup_e(curdir);
-    return 1;
-}
-
-int ftp_state_set_type_image(ftp_state_t *state, int is_image)
-{
-    assert(state != NULL);
-    
-    int old = state->is_type_image;
-    state->is_type_image = (is_image != 0) ? 1 : 0;
-    
-    return old;
-}
-
-int ftp_state_set_mode_stream(ftp_state_t *state, int is_stream)
-{
-    assert(state != NULL);
-    
-    int old = state->is_mode_stream;
-    state->is_mode_stream = (is_stream != 0) ? 1 : 0;
-    
-    return old;
-}
-
-int ftp_state_set_structure_file(ftp_state_t *state, int is_file)
-{
-    assert(state != NULL);
-    
-    int old = state->is_structure_file;
-    state->is_structure_file = (is_file != 0) ? 1 : 0;
-    
-    return old;
-}
-
-int ftp_state_open_data_socket(ftp_state_t *state)
-{
-    printf("open_data_socket\n");
-    
-    if(state->data_listen_socket != -1 || state->data_pid != 0 || state->control_socket == -1)
-        return FTP_STATUS_INVALID_COMMAND_SEQUENCE;
-    
-    struct sockaddr_in data_addr = {0};
-    socklen_t data_addr_len = sizeof(data_addr);
-    if(getsockname(state->control_socket, (struct sockaddr *)&data_addr, &data_addr_len) == -1) {
-        printf("getsockname: ");
-        return FTP_STATUS_CANT_OPEN_DATA_CONNECTION;
+        munmap(state->control_sem, sizeof(*state->control_sem));
     }
-    
-    data_addr.sin_port = htons(0);
-    
-    int data_socket = socket(AF_INET, SOCK_STREAM, 0);
-    if(data_socket == -1) {
-        printf("socket: ");
-        return FTP_STATUS_CANT_OPEN_DATA_CONNECTION;
-    }
-    
-    if(bind(data_socket, (struct sockaddr *)&data_addr, sizeof(data_addr)) == -1) {
-        printf("bind: ");
-        close(data_socket);
-        
-        return FTP_STATUS_CANT_OPEN_DATA_CONNECTION;
-    }
-       
-    if(listen(data_socket, 1) == -1) {
-        printf("listen: ");
-        close(data_socket);
-        
-        return FTP_STATUS_CANT_OPEN_DATA_CONNECTION;
-    }
-     
-    state->data_listen_socket = data_socket;
-    return FTP_STATUS_ENTERING_PASSIVE;
-}
 
-void ftp_state_free(ftp_state_t *state)
-{
-    assert(state != NULL);
-
-    if(state->username != NULL)
-        free(state->username);
-    
-    if(state->password != NULL)
-        free(state->password);
-
-    if(state->curdir != NULL)
-        free(state->curdir);
-
+    free(state->username);
+    free(state->password);
     free(state);
+
+    return true;
 }
+
+bool ftp_state_set_username(ftp_state_t *state, const char *username)
+{
+    assert(state != NULL);
+
+    char *new_username = NULL;
+    if(username != NULL && (new_username = strdup(username)) == NULL)
+        return false;
+
+    free(state->username);
+    state->username = new_username;
+
+    return true;
+}
+
+bool ftp_state_set_password(ftp_state_t *state, const char *password)
+{
+    assert(state != NULL);
+
+    char *new_password = NULL;
+    if(password != NULL && (new_password = strdup(password)) == NULL)
+        return false;
+
+    free(state->password);
+    state->password = new_password;
+
+    return true;
+}
+
+bool ftp_state_chdir(ftp_state_t *state, const char *dir)
+{
+    assert(state != NULL);
+    assert(dir != NULL);
+
+    int new_dir = openat(state->curdir_fd, dir, O_RDONLY);
+    if(new_dir == -1)
+        return false;
+
+    if(fchdir(new_dir) == -1)
+        return false;
+
+    close(state->curdir_fd);
+    state->curdir_fd = new_dir;
+
+    return true;
+}
+

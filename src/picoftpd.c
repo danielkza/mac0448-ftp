@@ -1,9 +1,10 @@
 #define _GNU_SOURCE
 
 #include <stdlib.h>
-#include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #include <assert.h>
+#include <stdio.h>
 
 #include <unistd.h>
 #include <strings.h>
@@ -13,235 +14,204 @@
 #include <sys/wait.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <poll.h>
 
-#include "commands.h"
 #include "util.h"
+#include "input.h"
+#include "commands.h"
 
-static ssize_t str_remove_suffix(char *str, const char *suffix)
+static const int CONTROL_POLL_TIMEOUT = 10; // 10ms
+static const unsigned int TRANSFER_KILL_WAIT_TIME = 1; // 1s
+
+static int kill_child(pid_t pid, unsigned int timeout)
 {
-    assert(str != NULL);
-    assert(suffix != NULL);
-    
-    char *str_end = strchr(str, '\0'),
-         *suffix_end = strchr(suffix, '\0');
-    
-    while((str_end != str || suffix_end != suffix)
-          && *(str_end - 1) == *(suffix_end - 1)) {
-        --str_end;
-        --suffix_end;
-    }
-    
-    if(suffix_end == suffix) {
-        *str_end = '\0';
-        return str_end - str;
-    } else {
+    if(kill(pid, SIGTERM) == -1)
+        return -1;
+
+    alarm(timeout);
+
+    int status = 0;
+    if(waitpid(pid, &status, 0) == -1) {
+        if(errno == EINTR)
+            return kill(pid, SIGKILL);
+
         return -1;
     }
+
+    return 0;
 }
 
-static ftp_status_t ftp_parse_run_command(FILE *in, char **buf, size_t *buf_len, ftp_state_t *state)
+#define CHECK_RESPONSE(status, msg) \
+do { \
+    ftp_result_t res = ftp_write_response(state, (status), (msg)); \
+    if(res != FTP_RESULT_OK) { goto abort; } \
+} while(0)
+
+static ftp_result_t check_data_child(ftp_state_t *state,
+                                     ftp_result_t cmd_res)
 {
-    assert(buf != NULL);
-    assert(buf_len != NULL);
-    
-    errno = 0;
-    if(getline(buf, buf_len, in) < 0) {
-        if(errno != 0) {
-            perror("getline: ");
-            return FTP_STATUS_INVALID_SYNTAX;
+    if(state->data_pid <= 0)
+        return FTP_RESULT_OK;
+
+    if(cmd_res == FTP_RESULT_ABORT || cmd_res == FTP_RESULT_ABORT_TRANSFER) {
+        (void)kill_child(state->data_pid, TRANSFER_KILL_WAIT_TIME);
+
+        CHECK_RESPONSE(FTP_STATUS_TRANSFER_FAILED, "Transfer aborted");
+        CHECK_RESPONSE(FTP_STATUS_OK, "Abort successfull");
+    } else {
+        int status = 0;
+        if(waitpid(state->data_pid, &status, WNOHANG) == state->data_pid
+           && WIFEXITED(status)) {
+            if(WEXITSTATUS(status) == 0) {
+                CHECK_RESPONSE(FTP_STATUS_TRANSFER_SUCCEEDED,
+                               "Transfer succeeded");
+            } else {
+                CHECK_RESPONSE(FTP_STATUS_TRANSFER_FAILED, "Transfer failed");
+            }
+
+            state->data_pid = 0;
         }
-        
-        return FTP_COMMAND_EOF;
     }
-   
-    if(str_remove_suffix(*buf, "\r\n") <= 0)
-        return FTP_STATUS_INVALID_SYNTAX;
-    
-    printf("Line: '%s'\n", *buf);
-   
-    char *command_name = *buf, *arg;
-    char *space_pos = strchr(*buf, ' ');
-    if(space_pos == NULL)
-        arg = NULL;
-    else {
-        *space_pos = '\0';
-        arg = space_pos + 1;
-    }
-    
-    ftp_command_t *cur_command = &(picoftpd_commands[0]);
 
-    while(cur_command->name != NULL
-          && strcasecmp(cur_command->name, command_name) != 0) {
-        cur_command++;
-    }
-    
-    if(cur_command->name == NULL)
-        return FTP_STATUS_INVALID_SYNTAX;
-    
-    printf("arg: '%s'\n", arg);
-    int command_res = (*cur_command->func)(arg, state);
-    
-    return command_res;
+    return cmd_res;
+abort:
+    return FTP_RESULT_ABORT;
 }
 
-char* ftp_pasv_reply(ftp_state_t *state)
-{
-    assert(state != NULL);
-    
-    struct sockaddr_in data_addr;
-    socklen_t data_addr_len = sizeof(data_addr);
-    if(getsockname(state->data_listen_socket, (struct sockaddr *)&data_addr, &data_addr_len) == -1)
-        return NULL;
-    
-    char *addr = strdup_e(inet_ntoa(data_addr.sin_addr)), *addr_dot = addr;
-    while((addr_dot = strchr(addr_dot, '.')) != NULL)
-        *(addr_dot++) = ',';
-    
-    unsigned int port_high = (ntohs(data_addr.sin_port) >> 8) & 0xFF,
-                 port_low = (ntohs(data_addr.sin_port)) & 0xFF;
-      
-    char *result;
-    if(asprintf(&result, "227 Entering Passive Mode (%s,%u,%u)\r\n",
-                addr, port_high, port_low) == -1) {
-        fputs("Out of memory, aborting!\n", stderr);
-        abort();
-    }
-    
-    free(addr);
-    return result;
-}
+#undef CHECK_RESPONSE
 
-void ftp_do_control(int control_socket)
+static void ftp_do_control(int control_socket)
 {
     ftp_state_t *state = ftp_state_new();
     if(state == NULL)
         return;
-    
+
     state->control_socket = control_socket;
-    
-    FILE *control_file = fdopen(control_socket, "w+");
-    if(control_file == NULL)
-        return;
-    
-    fputs("220 picoftpd\r\n", control_file);
-    
-    char *buf = NULL;
-    size_t buf_len = 0;
-       
+    if(ftp_hello(state) != FTP_RESULT_OK)
+        goto cleanup;
+
+    char line[PICOFTPD_LINE_MAX] = "";
+    size_t line_len = 0;
+
+    struct pollfd control_poll;
+    control_poll.fd = control_socket;
+    control_poll.events = POLLIN | POLLERR;
+
     for(;;) {
-        ftp_status_t ftp_status;
-        
-        if(state->data_pid > 0) {
-            int status = 0;
-            if(waitpid(state->data_pid, &status, 0) > 0) {
-                if(WEXITSTATUS(status) != 0)
-                    ftp_status = FTP_STATUS_TRANSFER_FAILED;
-                else
-                    ftp_status = FTP_STATUS_TRANSFER_SUCCEEDED;
-                
-                state->data_pid = 0;
-            } else {
-                perror("waitpid: ");
-                break;
+        /* Happily continue running if we get OK results, or if no commands are
+         * read from the control socket
+         */
+        ftp_result_t res = FTP_RESULT_OK;
+
+        control_poll.revents = 0;
+
+        int poll_res = poll(&control_poll, 1, CONTROL_POLL_TIMEOUT);
+        if(poll_res == -1) {
+            ftp_debug_perror(state, "poll");
+            res = FTP_RESULT_ABORT;
+        } else if(poll_res > 0) {
+            int read_res = ftp_input_read(control_socket, line, &line_len,
+                                          sizeof(line));
+            if(read_res == -1) {
+                ftp_debug_perror(state, "recv");
+                res = FTP_RESULT_ABORT;
+            } else if(read_res > 0) {
+                res = ftp_input_parse_run(line, state);
+                ftp_input_shift_buf(line, &line_len);
             }
-        } else {
-            ftp_status = ftp_parse_run_command(control_file, &buf, &buf_len, state);
         }
-         
-        if (ftp_status == FTP_STATUS_CLOSING)
+
+        res = check_data_child(state, res);
+
+        if(res == FTP_RESULT_EOF) {
+            ftp_quit(NULL, state);
             break;
-        else if (ftp_status == FTP_STATUS_ENTERING_PASSIVE) {
-            char *reply = ftp_pasv_reply(state);
-            printf("pasv reply: %s", reply);
-            fputs(reply, control_file);
-            free(reply);
+        } else if(res == FTP_RESULT_ABORT) {
+            break;
         }
-        else if (ftp_status > 0)
-            fprintf(control_file, "%d\r\n", (int)ftp_status);
-        else
-            break;
     }
-    
-    free(state);
-    free(buf);
-    fclose(control_file);
-    
+
+cleanup:
+    close(control_socket);
     state->control_socket = -1;
+
+    ftp_state_free(state);
 }
 
 int main(int argc, char **argv)
 {
-    int port;
+    uint16_t port;
     if(argc < 2 || (port = atoi(argv[1])) <= 0) {
-        puts("Error: invalid port\n");
+        fputs("Error: invalid port\n", stderr);
         return 1;
     }
-    
+
     struct sockaddr_in control_addr = {0};
     control_addr.sin_family      = AF_INET;
     control_addr.sin_addr.s_addr = htonl(INADDR_ANY);
     control_addr.sin_port = htons(port);
-    
+
+    const char *ip = "0.0.0.0";
     if(argc > 2) {
-        if(inet_aton(argv[2], &(control_addr.sin_addr)) == 0) {
-            puts("Error: invalid IP\n");
+        ip = argv[2];
+        if(inet_aton(ip, &(control_addr.sin_addr)) == 0) {
+            fputs("Error: invalid IP\n", stderr);
             return 1;
-        }   
+        }
     }
-            
+
     int control_listen_socket;
     if((control_listen_socket = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
-        perror("socket: ");
+        perror("socket");
         return 1;
     }
-    
-    printf("socket\n");
-    
-    if(bind(control_listen_socket, (struct sockaddr*) &control_addr, sizeof(control_addr)) == -1) {
-        perror("bind: ");
+
+    fputs("Opened main socket\n", stderr);
+
+    if(bind(control_listen_socket, (const struct sockaddr*) &control_addr,
+            sizeof(control_addr)) == -1) {
+        perror("bind");
         close(control_listen_socket);
-     
+
         return 1;
     }
-    
-    printf("bind\n");
-    
+
+    fputs("Bound main socket\n", stderr);
+
     if(listen(control_listen_socket, 1) == -1) {
-        perror("listen: ");
+        perror("listen");
         close(control_listen_socket);
-     
+
         return 1;
     }
-    
-    printf("listen\n");
-    
+
+    fprintf(stderr, "Listening at %s:%u\n", ip, (unsigned int)port);
+
     for(;;) {
         int control_socket = accept(control_listen_socket, (struct sockaddr *) NULL, NULL);
         if(control_socket == -1) {
-            perror("accept: ");
+            perror("accept");
             continue;
         }
-        
-        printf("accept %d\n", control_socket);
-        
+
+        fprintf(stderr, "accept %d\n", control_socket);
+
         pid_t child = fork();
         if(child < 0) {
-            perror("fork: ");
-            abort();
+            perror("fork");
         }
-            
+
         if(child == 0) {
             close(control_listen_socket);
-            printf("do_control\n");
+            fputs("do_control\n", stderr);
             ftp_do_control(control_socket);
-            
+
             exit(0);
         } else {
             close(control_socket);
         }
     }
-    
+
     close(control_listen_socket);
-    
     return 0;
 }

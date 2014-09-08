@@ -1,31 +1,56 @@
-#define _GNU_SOURCE
-
+#include <stdarg.h>
+#include <string.h>
+#include <assert.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <string.h>
 
 #include "util.h"
 
-static const char out_of_memory_msg[] = "Out of memory, aborting!\n";
-
-char *strdup_e(const char *in)
+ssize_t str_remove_suffix(char *str, const char *suffix)
 {
-    char *out = strdup(in);
-    if(out == NULL) {
-        fputs(out_of_memory_msg, stderr);
-        abort();
+    assert(str != NULL);
+    assert(suffix != NULL);
+
+    char *str_end = strchr(str, '\0'),
+    *suffix_end = strchr(suffix, '\0');
+
+    while((str_end != str || suffix_end != suffix)
+          && *(str_end - 1) == *(suffix_end - 1)) {
+        --str_end;
+        --suffix_end;
     }
 
-    return out;
+    if(suffix_end == suffix) {
+        *str_end = '\0';
+        return str_end - str;
+    } else {
+        return -1;
+    }
 }
 
-void *malloc_e(size_t size)
+void ftp_debug(ftp_state_t *state, const char *format, ...)
 {
-    void *m = malloc(size);
-    if(m == NULL) {
-        fputs(out_of_memory_msg, stderr);
-        abort();
-    }
+    assert(state != NULL);
+    assert(format != NULL);
 
-    return m;
+    fprintf(stderr, "%d: ", state->control_socket);
+
+    va_list args;
+    va_start(args, format);
+    vfprintf(stderr, format, args);
+    va_end(args);
+}
+
+void ftp_debug_perror(ftp_state_t *state, const char *msg)
+{
+    assert(state != NULL);
+
+    int errno_saved = errno;
+
+    fprintf(stderr, "%d: ", state->control_socket);
+
+    errno = errno_saved;
+    perror(msg);
+    errno = errno_saved;
 }
